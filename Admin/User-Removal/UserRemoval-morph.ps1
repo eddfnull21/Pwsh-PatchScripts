@@ -174,10 +174,18 @@ function Get-UserProfileInventory {
         $cim = if (-not $isBak) { $cimBySid[$sid] } else { $null }
         $account = & $nameOf $sid
 
-        $lastUsed = @(
-            ConvertFrom-UPFileTime $p.LocalProfileLoadTimeHigh $p.LocalProfileLoadTimeLow
-            ConvertFrom-UPFileTime $p.LocalProfileUnloadTimeHigh $p.LocalProfileUnloadTimeLow
-        ) | Where-Object { $_ } | Sort-Object -Descending | Select-Object -First 1
+        # 1st choice: the profile folder's LastWriteTime (what 'ls C:\Users' shows) an estimation.
+        $lastUsed = $null
+        if ($path) {
+            $lastUsed = (Get-Item -LiteralPath $path -Force -EA SilentlyContinue).LastWriteTime
+        }
+        # Fallback ProfileList load/unload time, NTUSER.DAT, Win32_UserProfile. (something to fix.. will likely show same date for all users)
+        if (-not $lastUsed) {
+            $lastUsed = @(
+                ConvertFrom-UPFileTime $p.LocalProfileLoadTimeHigh $p.LocalProfileLoadTimeLow
+                ConvertFrom-UPFileTime $p.LocalProfileUnloadTimeHigh $p.LocalProfileUnloadTimeLow
+            ) | Where-Object { $_ } | Sort-Object -Descending | Select-Object -First 1
+        }
         if (-not $lastUsed -and $path) {
             $lastUsed = (Get-Item -LiteralPath (Join-Path $path 'NTUSER.DAT') -Force -EA SilentlyContinue).LastWriteTime
         }
