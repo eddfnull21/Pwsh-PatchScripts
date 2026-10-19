@@ -119,7 +119,8 @@ function Remove-UPFolder {
 function ConvertFrom-UPFileTime {
     param($High, $Low)
     if ($null -eq $High -or $null -eq $Low) { return $null }
-    $ft = ([int64][uint32]$High -shl 32) -bor [int64][uint32]$Low
+    # REG_DWORD arrives as Int32 (negative above 0x7FFFFFFF); might error since [uint32] of a negative throws.
+    $ft = (([int64]$High -band 4294967295) -shl 32) -bor ([int64]$Low -band 4294967295)
     if ($ft -le 0) { return $null }
     return [datetime]::FromFileTime($ft)
 }
