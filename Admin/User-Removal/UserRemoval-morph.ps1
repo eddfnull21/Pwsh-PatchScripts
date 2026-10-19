@@ -175,18 +175,11 @@ function Get-UserProfileInventory {
         $cim = if (-not $isBak) { $cimBySid[$sid] } else { $null }
         $account = & $nameOf $sid
 
-        # 1st choice: the profile folder's LastWriteTime (what 'ls C:\Users' shows) an estimation.
-        $lastUsed = $null
-        if ($path) {
-            $lastUsed = (Get-Item -LiteralPath $path -Force -EA SilentlyContinue).LastWriteTime
-        }
-        # Fallback ProfileList load/unload time, NTUSER.DAT, Win32_UserProfile. (something to fix.. will likely show same date for all users)
-        if (-not $lastUsed) {
-            $lastUsed = @(
-                ConvertFrom-UPFileTime $p.LocalProfileLoadTimeHigh $p.LocalProfileLoadTimeLow
-                ConvertFrom-UPFileTime $p.LocalProfileUnloadTimeHigh $p.LocalProfileUnloadTimeLow
-            ) | Where-Object { $_ } | Sort-Object -Descending | Select-Object -First 1
-        }
+        # ProfileList times change only when Windows loads/unloads the profile for a session;
+        # NTUSER.DAT and Win32_UserProfile are also bumped by updates and scans, so they are fallbacks only.
+        $lastLoad   = ConvertFrom-UPFileTime $p.LocalProfileLoadTimeHigh   $p.LocalProfileLoadTimeLow
+        $lastUnload = ConvertFrom-UPFileTime $p.LocalProfileUnloadTimeHigh $p.LocalProfileUnloadTimeLow
+        $lastUsed = @($lastLoad, $lastUnload) | Where-Object { $_ } | Sort-Object -Descending | Select-Object -First 1
         if (-not $lastUsed -and $path) {
             $lastUsed = (Get-Item -LiteralPath (Join-Path $path 'NTUSER.DAT') -Force -EA SilentlyContinue).LastWriteTime
         }
@@ -201,6 +194,8 @@ function Get-UserProfileInventory {
             PathExists = [bool]($path -and (Test-Path -LiteralPath $path -ErrorAction SilentlyContinue))
             Loaded     = [bool]($cim -and $cim.Loaded)
             LastUsed   = $lastUsed
+            LastLoad   = $lastLoad
+            LastUnload = $lastUnload
             IsTemp     = [bool]($path -and (Split-Path $path -Leaf) -match '^TEMP(\.|$)')
             IsBak      = $isBak
             HasAccount = $localBySid.ContainsKey($sid)
@@ -257,6 +252,8 @@ function Show-UserProfileInventory {
         Format-Table @{ n = 'Account'; e = { if ($_.Account) { $_.Account } elseif ($_.SID) { "(unresolved) $($_.SID)" } else { '-' } } },
             Type,
             @{ n = 'LastUsed'; e = { if ($_.Loaded) { 'in use' } elseif ($_.LastUsed) { $_.LastUsed.ToString('yyyy-MM-dd') } else { '-' } } },
+            @{ n = 'LastLoad'; e = { if ($_.LastLoad) { $_.LastLoad.ToString('yyyy-MM-dd HH:mm') } } },
+            @{ n = 'LastUnload'; e = { if ($_.LastUnload) { $_.LastUnload.ToString('yyyy-MM-dd HH:mm') } } },
             @{ n = 'Flags'; e = { Get-UPFlags $_ } },
             Path -AutoSize -Wrap | Out-String -Width 250 | Out-Host
 }
