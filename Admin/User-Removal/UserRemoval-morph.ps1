@@ -1,5 +1,5 @@
 # Tested with PSScriptAnalyzer 1.25.0 and Pester 6.2.0 on Windows PowerShell 5.1 (tests\Morphs.Tests.ps1, 2026-10-11): static, paste-model and elevation-gate checks; live changes not run.
-# 2026-10-19: LastUsedFrom / Created / HiveWrite and NTUSER.DAT-first dating of unregistered folders added - re-run the tests before updating the line above.
+# 2026-10-19: LastUsedFrom / Created / HiveWrite added; fallback date is now the folder write time, not NTUSER.DAT - re-run the tests before updating the line above.
 <#
 .SYNOPSIS
     User profile / local account removal - Check / Remove / Cleanup / Interactive. RMM-ready.
@@ -15,8 +15,9 @@
                          .bak      ProfileList\<SID>.bak key (the classic TEMP-profile cause)
                          Orphan    folder under the profiles directory with no registration
                        Last used = ProfileList load/unload time (Windows 10 1903+), falling back to
-                       NTUSER.DAT, then WMI; for unregistered folders NTUSER.DAT, then the folder's
-                       write time. The From column in Check shows which source was used.
+                       the profile folder's write time (then WMI). NTUSER.DAT is shown (HiveWrite)
+                       but not used: Windows servicing rewrites every registered hive. The From
+                       column in Check shows which source was used.
                        Returns 2 when broken state is found, or when the -Options
                        Users / InactiveDays targets below are present.
     -Mode Remove       Non-interactive. Targets come from -Options (one of them is required):
@@ -190,14 +191,16 @@ function Get-UserProfileInventory {
         $cim = if (-not $isBak) { $cimBySid[$sid] } else { $null }
         $account = & $nameOf $sid
 
-        # ProfileList times change only when Windows loads/unloads the profile for a session;
-        # NTUSER.DAT and Win32_UserProfile are also bumped by updates and scans, so they are fallbacks only.
+        # ProfileList times change only when Windows loads/unloads the profile for a session. On 1903+
+        # every logon sets them, so if they are missing the user has not logged on since; fall back to
+        # the folder's write time. NTUSER.DAT and Win32_UserProfile are NOT used for dating: servicing
+        # loads every registered hive and bumps both (seen: all hives rewritten at the same minute).
         $lastLoad   = ConvertFrom-UPFileTime $p.LocalProfileLoadTimeHigh   $p.LocalProfileLoadTimeLow
         $lastUnload = ConvertFrom-UPFileTime $p.LocalProfileUnloadTimeHigh $p.LocalProfileUnloadTimeLow
         $times = Get-UPFolderTimes $path
         $lastUsed = @($lastLoad, $lastUnload) | Where-Object { $_ } | Sort-Object -Descending | Select-Object -First 1
         $lastUsedFrom = 'ProfileList'
-        if (-not $lastUsed) { $lastUsed = $times.HiveWrite; $lastUsedFrom = 'NTUSER.DAT' }
+        if (-not $lastUsed) { $lastUsed = $times.FolderWrite; $lastUsedFrom = 'Folder' }
         if (-not $lastUsed -and $cim) { $lastUsed = $cim.LastUseTime; $lastUsedFrom = 'WMI' }
         if (-not $lastUsed) { $lastUsedFrom = $null }
 
@@ -237,8 +240,8 @@ function Get-UserProfileInventory {
         })
     }
 
-    # Folders nobody is registered for. Their NTUSER.DAT is never loaded by Windows servicing
-    # (it only loads ProfileList hives), so its write time is the user's last logoff.
+    # Folders nobody is registered for: dated by the folder's write time, as registered profiles
+    # without ProfileList times are (NTUSER.DAT can be rewritten by imaging/migration tools).
     foreach ($dir in Get-ChildItem -LiteralPath $root -Directory -Force -ErrorAction SilentlyContinue) {
         if ($dir.Name -in $UPReservedFolders -or $dir.Name -match $UPSystemFolderPattern) { continue }
         if ($dir.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }   # e.g. 'All Users', 'Default User' junctions
@@ -247,8 +250,7 @@ function Get-UserProfileInventory {
         $rows.Add([pscustomobject]@{
             Kind = 'OrphanFolder'; SID = $null; Account = $null; Type = '-'; Path = $dir.FullName
             PathExists = $true; Loaded = $false
-            LastUsed     = $(if ($times.HiveWrite) { $times.HiveWrite } else { $dir.LastWriteTime })
-            LastUsedFrom = $(if ($times.HiveWrite) { 'NTUSER.DAT' } else { 'Folder' })
+            LastUsed = $dir.LastWriteTime; LastUsedFrom = 'Folder'
             Created = $times.Created; HiveWrite = $times.HiveWrite
             IsTemp = $dir.Name -match '^TEMP(\.|$)'; IsBak = $false; HasAccount = $false
             Protected = $(if ($dir.Name -in $Exclude) { 'Excluded' } else { $null }); RegKey = $null
