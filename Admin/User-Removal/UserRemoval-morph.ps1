@@ -1,4 +1,5 @@
 # Tested with PSScriptAnalyzer 1.25.0 and Pester 6.2.0 on Windows PowerShell 5.1 (tests\Morphs.Tests.ps1, 2026-10-11): static, paste-model and elevation-gate checks; live changes not run.
+# 2026-10-19: LastUsedFrom / Created / HiveWrite and NTUSER.DAT-first dating of unregistered folders added - re-run the tests before updating the line above.
 <#
 .SYNOPSIS
     User profile / local account removal - Check / Remove / Cleanup / Interactive. RMM-ready.
@@ -14,7 +15,9 @@
                          .bak      ProfileList\<SID>.bak key (the classic TEMP-profile cause)
                          Orphan    folder under the profiles directory with no registration
                        Last used = ProfileList load/unload time (Windows 10 1903+), falling back to
-                       NTUSER.DAT. Returns 2 when broken state is found, or when the -Options
+                       NTUSER.DAT, then WMI; for unregistered folders NTUSER.DAT, then the folder's
+                       write time. The From column in Check shows which source was used.
+                       Returns 2 when broken state is found, or when the -Options
                        Users / InactiveDays targets below are present.
     -Mode Remove       Non-interactive. Targets come from -Options (one of them is required):
                          Users        = @('CORP\bob', 'bob', 'S-1-5-21-...', 'C:\Users\bob')
@@ -125,6 +128,18 @@ function ConvertFrom-UPFileTime {
     return [datetime]::FromFileTime($ft)
 }
 
+# Folder and hive timestamps: shown in Check, and used as last-use fallbacks.
+function Get-UPFolderTimes {
+    param([string]$Path)
+    $dir  = if ($Path) { Get-Item -LiteralPath $Path -Force -EA SilentlyContinue }
+    $hive = if ($dir)  { Get-Item -LiteralPath (Join-Path $Path 'NTUSER.DAT') -Force -EA SilentlyContinue }
+    [pscustomobject]@{
+        Created     = if ($dir)  { $dir.CreationTime }   else { $null }
+        FolderWrite = if ($dir)  { $dir.LastWriteTime }  else { $null }
+        HiveWrite   = if ($hive) { $hive.LastWriteTime } else { $null }
+    }
+}
+
 #endregion
 
 #region -------------------- Get-UserProfileInventory (read-only) --------------------
@@ -179,28 +194,32 @@ function Get-UserProfileInventory {
         # NTUSER.DAT and Win32_UserProfile are also bumped by updates and scans, so they are fallbacks only.
         $lastLoad   = ConvertFrom-UPFileTime $p.LocalProfileLoadTimeHigh   $p.LocalProfileLoadTimeLow
         $lastUnload = ConvertFrom-UPFileTime $p.LocalProfileUnloadTimeHigh $p.LocalProfileUnloadTimeLow
+        $times = Get-UPFolderTimes $path
         $lastUsed = @($lastLoad, $lastUnload) | Where-Object { $_ } | Sort-Object -Descending | Select-Object -First 1
-        if (-not $lastUsed -and $path) {
-            $lastUsed = (Get-Item -LiteralPath (Join-Path $path 'NTUSER.DAT') -Force -EA SilentlyContinue).LastWriteTime
-        }
-        if (-not $lastUsed -and $cim) { $lastUsed = $cim.LastUseTime }
+        $lastUsedFrom = 'ProfileList'
+        if (-not $lastUsed) { $lastUsed = $times.HiveWrite; $lastUsedFrom = 'NTUSER.DAT' }
+        if (-not $lastUsed -and $cim) { $lastUsed = $cim.LastUseTime; $lastUsedFrom = 'WMI' }
+        if (-not $lastUsed) { $lastUsedFrom = $null }
 
         $rows.Add([pscustomobject]@{
-            Kind       = 'Profile'
-            SID        = $sid
-            Account    = $account
-            Type       = & $typeOf $sid
-            Path       = $path
-            PathExists = [bool]($path -and (Test-Path -LiteralPath $path -ErrorAction SilentlyContinue))
-            Loaded     = [bool]($cim -and $cim.Loaded)
-            LastUsed   = $lastUsed
-            LastLoad   = $lastLoad
-            LastUnload = $lastUnload
-            IsTemp     = [bool]($path -and (Split-Path $path -Leaf) -match '^TEMP(\.|$)')
-            IsBak      = $isBak
-            HasAccount = $localBySid.ContainsKey($sid)
-            Protected  = & $protect $sid $account $path
-            RegKey     = $key.PSPath
+            Kind         = 'Profile'
+            SID          = $sid
+            Account      = $account
+            Type         = & $typeOf $sid
+            Path         = $path
+            PathExists   = [bool]($path -and (Test-Path -LiteralPath $path -ErrorAction SilentlyContinue))
+            Loaded       = [bool]($cim -and $cim.Loaded)
+            LastUsed     = $lastUsed
+            LastUsedFrom = $lastUsedFrom
+            Created      = $times.Created
+            HiveWrite    = $times.HiveWrite
+            LastLoad     = $lastLoad
+            LastUnload   = $lastUnload
+            IsTemp       = [bool]($path -and (Split-Path $path -Leaf) -match '^TEMP(\.|$)')
+            IsBak        = $isBak
+            HasAccount   = $localBySid.ContainsKey($sid)
+            Protected    = & $protect $sid $account $path
+            RegKey       = $key.PSPath
         })
     }
 
@@ -211,19 +230,26 @@ function Get-UserProfileInventory {
         $account = "$env:COMPUTERNAME\$($u.Name)"
         $rows.Add([pscustomobject]@{
             Kind = 'AccountOnly'; SID = $sid; Account = $account; Type = 'Local'; Path = $null
-            PathExists = $false; Loaded = $false; LastUsed = $u.LastLogon; IsTemp = $false; IsBak = $false
+            PathExists = $false; Loaded = $false; LastUsed = $u.LastLogon
+            LastUsedFrom = $(if ($u.LastLogon) { 'LastLogon' }); Created = $null; HiveWrite = $null
+            IsTemp = $false; IsBak = $false
             HasAccount = $true; Protected = & $protect $sid $account $null; RegKey = $null
         })
     }
 
-    # Folders nobody is registered for.
+    # Folders nobody is registered for. Their NTUSER.DAT is never loaded by Windows servicing
+    # (it only loads ProfileList hives), so its write time is the user's last logoff.
     foreach ($dir in Get-ChildItem -LiteralPath $root -Directory -Force -ErrorAction SilentlyContinue) {
         if ($dir.Name -in $UPReservedFolders -or $dir.Name -match $UPSystemFolderPattern) { continue }
         if ($dir.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }   # e.g. 'All Users', 'Default User' junctions
         if ($registeredPaths.ContainsKey($dir.FullName.TrimEnd('\').ToLowerInvariant())) { continue }
+        $times = Get-UPFolderTimes $dir.FullName
         $rows.Add([pscustomobject]@{
             Kind = 'OrphanFolder'; SID = $null; Account = $null; Type = '-'; Path = $dir.FullName
-            PathExists = $true; Loaded = $false; LastUsed = $dir.LastWriteTime
+            PathExists = $true; Loaded = $false
+            LastUsed     = $(if ($times.HiveWrite) { $times.HiveWrite } else { $dir.LastWriteTime })
+            LastUsedFrom = $(if ($times.HiveWrite) { 'NTUSER.DAT' } else { 'Folder' })
+            Created = $times.Created; HiveWrite = $times.HiveWrite
             IsTemp = $dir.Name -match '^TEMP(\.|$)'; IsBak = $false; HasAccount = $false
             Protected = $(if ($dir.Name -in $Exclude) { 'Excluded' } else { $null }); RegKey = $null
         })
@@ -252,10 +278,13 @@ function Show-UserProfileInventory {
         Format-Table @{ n = 'Account'; e = { if ($_.Account) { $_.Account } elseif ($_.SID) { "(unresolved) $($_.SID)" } else { '-' } } },
             Type,
             @{ n = 'LastUsed'; e = { if ($_.Loaded) { 'in use' } elseif ($_.LastUsed) { $_.LastUsed.ToString('yyyy-MM-dd') } else { '-' } } },
+            @{ n = 'From'; e = { $_.LastUsedFrom } },
             @{ n = 'LastLoad'; e = { if ($_.LastLoad) { $_.LastLoad.ToString('yyyy-MM-dd HH:mm') } } },
             @{ n = 'LastUnload'; e = { if ($_.LastUnload) { $_.LastUnload.ToString('yyyy-MM-dd HH:mm') } } },
+            @{ n = 'HiveWrite'; e = { if ($_.HiveWrite) { $_.HiveWrite.ToString('yyyy-MM-dd HH:mm') } } },
+            @{ n = 'Created'; e = { if ($_.Created) { $_.Created.ToString('yyyy-MM-dd') } } },
             @{ n = 'Flags'; e = { Get-UPFlags $_ } },
-            Path -AutoSize -Wrap | Out-String -Width 250 | Out-Host
+            Path -AutoSize -Wrap | Out-String -Width 300 | Out-Host
 }
 
 # Broken state Cleanup acts on (or reports).
