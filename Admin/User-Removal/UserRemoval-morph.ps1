@@ -588,7 +588,7 @@ function Invoke-UserRemoval {
                 $targets = @()
                 if ($users -or $days) {
                     $targets = @(Resolve-UserTarget -Rows $rows -Users $users -InactiveDays $days -IncludeNeverUsed:([bool]$Options.IncludeNeverUsed))
-                    Write-Host "Targets: $($targets.Count)$(if ($targets) { ' -> ' + (($targets | ForEach-Object { $_.Account }) -join ', ') })" -ForegroundColor $(if ($targets) { 'Yellow' } else { 'Gray' })
+                    Write-Host "Targets: $($targets.Count)$(if ($targets) { ' -> ' + (($targets | ForEach-Object { if ($_.Account) { $_.Account } elseif ($_.Path) { "? $(Split-Path $_.Path -Leaf)" } else { $_.SID } }) -join ', ') })" -ForegroundColor $(if ($targets) { 'Yellow' } else { 'Gray' })
                 }
                 if ($broken -or $targets) { return 2 }
                 Write-Host 'Nothing to report.'
