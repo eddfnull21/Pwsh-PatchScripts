@@ -457,7 +457,7 @@ function Show-UPSelectionList {
     Write-Host '  Up/Down Navigate  |  SPACE Select  |  ENTER Confirm  |  Q Quit' -ForegroundColor Cyan
     Write-Host '==============================================================' -ForegroundColor Cyan
     Write-Host ''
-    Write-Host ('  {0} {1} {2} {3} {4}' -f ' ', 'SEL', 'USER'.PadRight(34), 'STATUS'.PadRight(20), 'LAST USE') -ForegroundColor DarkGray
+    Write-Host ('  {0} {1} {2} {3} {4}' -f ' ', 'SEL', 'USER'.PadRight(44), 'STATUS'.PadRight(20), 'LAST USE') -ForegroundColor DarkGray
 
     for ($i = 0; $i -lt $Users.Count; $i++) {
         $item = $Users[$i]
@@ -465,10 +465,12 @@ function Show-UPSelectionList {
         $isCurrent = $i -eq $CurrentIndex
         $checkbox = if ($isSelected) { '[X]' } else { '[ ]' }
         $prefix = if ($isCurrent) { '>' } else { ' ' }
-        $label = Get-TruncatedString -Text $(if ($item.Account) { $item.Account } else { $item.SID }) -MaxLength 34
+        # Unresolved SIDs all share the machine/domain prefix, so show the folder name instead.
+        $name = if ($item.Account) { $item.Account } elseif ($item.Path) { "? $(Split-Path $item.Path -Leaf)" } else { $item.SID }
+        $label = Get-TruncatedString -Text $name -MaxLength 44
         $status = Get-TruncatedString -Text $(Get-UPFlags $item) -MaxLength 20
         $lastUse = if ($item.Loaded) { 'in use' } elseif ($item.LastUsed) { $item.LastUsed.ToString('yyyy-MM-dd HH:mm') } else { 'N/A' }
-        $line = '{0} {1} {2} {3} {4}' -f $prefix, $checkbox, $label.PadRight(34), $status.PadRight(20), $lastUse
+        $line = '{0} {1} {2} {3} {4}' -f $prefix, $checkbox, $label.PadRight(44), $status.PadRight(20), $lastUse
 
         if ($item.Loaded) { if ($isCurrent) { Write-Host $line -ForegroundColor Black -BackgroundColor DarkGray } else { Write-Host $line -ForegroundColor DarkGray } }
         elseif ($isCurrent -and $isSelected) { Write-Host $line -ForegroundColor Black -BackgroundColor Green }
@@ -481,6 +483,7 @@ function Show-UPSelectionList {
     Write-Host ''
     Write-Host "Selected: $($SelectedKeys.Count) user(s)" -ForegroundColor Magenta
     Write-Host 'ACC = local account (also removed)  |  LOADED = in use, cannot be removed  |  NoProfile = account only' -ForegroundColor DarkGray
+    Write-Host '? = account name not resolvable (deleted, or domain unreachable) - shown by profile folder' -ForegroundColor DarkGray
 }
 
 function Confirm-UPDeletion {
@@ -491,7 +494,7 @@ function Confirm-UPDeletion {
     Write-Host '==============================================================' -ForegroundColor Yellow
     Write-Host ''
     foreach ($item in $SelectedItems) {
-        Write-Host "  * $($item.Account)" -ForegroundColor Cyan
+        Write-Host "  * $(if ($item.Account) { $item.Account } else { '(unresolved account)' })" -ForegroundColor Cyan
         if ($item.Path) { Write-Host "    Path: $($item.Path)" -ForegroundColor DarkGray }
         Write-Host "    SID:  $($item.SID)" -ForegroundColor DarkGray
         if ($item.LastUsed) { Write-Host "    Last: $($item.LastUsed)" -ForegroundColor DarkGray }
