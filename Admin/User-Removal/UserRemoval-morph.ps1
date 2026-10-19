@@ -341,13 +341,21 @@ function Resolve-UserTarget {
 
 function Remove-UserProfileTarget {
     [CmdletBinding(SupportsShouldProcess = $true)]
-    param($Row, [switch]$RemoveAccount, [string]$Root)
+    param($Row, [switch]$RemoveAccount, [string]$Root, [string]$Progress)
 
     $res = [pscustomobject]@{
         Account = $Row.Account; SID = $Row.SID; Path = $Row.Path
         Profile = '-'; Folder = '-'; LocalAccount = '-'; Status = ''
     }
-    if ($Row.Protected) { $res.Status = "Skipped ($($Row.Protected))"; return $res }
+    # Progress lines go to the host (console or RMM log); results are still returned as objects.
+    $label = if ($Row.Account) { $Row.Account } elseif ($Row.Path) { "? $(Split-Path $Row.Path -Leaf)" } else { $Row.SID }
+    $say = { param($Text, $Color = 'Gray') Write-Host "      $Text" -ForegroundColor $Color }
+    Write-Host ''
+    Write-Host "$Progress$label" -ForegroundColor Cyan
+    & $say "SID:  $($Row.SID)" DarkGray
+    if ($Row.Path) { & $say "Path: $($Row.Path)" DarkGray }
+
+    if ($Row.Protected) { $res.Status = "Skipped ($($Row.Protected))"; & $say $res.Status Yellow; return $res }
     $failed = $false; $partial = $false
 
     if ($Row.Kind -eq 'Profile') {
@@ -355,25 +363,33 @@ function Remove-UserProfileTarget {
         $cim = Get-CimInstance Win32_UserProfile -Filter "SID='$($Row.SID)'" -ErrorAction SilentlyContinue
         if (-not $cim) {
             $res.Profile = 'No profile record'
+            & $say 'Profile: no profile record in Windows - nothing to delete' Yellow
         }
         elseif ($cim.Loaded) {
-            $res.Status = 'Skipped (profile loaded - user logged on or in use)'; return $res
+            $res.Status = 'Skipped (profile loaded - user logged on or in use)'; & $say $res.Status Yellow; return $res
         }
         elseif ($PSCmdlet.ShouldProcess("$($Row.Account) $($Row.Path)", 'Delete profile (registration + folder)')) {
+            & $say 'Profile: deleting registry entry and folder (large profiles can take minutes)...'
+            $sw = [Diagnostics.Stopwatch]::StartNew()
             try {
                 $cim | Remove-CimInstance -ErrorAction Stop
                 $res.Profile = 'Removed'
+                & $say ('Profile: removed ({0:N1}s)' -f $sw.Elapsed.TotalSeconds) Green
             }
             catch {
                 # Nothing else is touched: a folder deleted without its registration gives the user a TEMP profile.
                 $res.Profile = "FAILED: $($_.Exception.Message)"
                 $res.Status = 'Failed'
+                & $say "Profile: FAILED - $($_.Exception.Message)" Red
+                & $say 'Nothing else changed for this user.' Red
                 return $res
             }
             if ($Row.Path -and (Test-Path -LiteralPath $Row.Path)) {
+                & $say 'Folder: still present (locked files?), removing leftover...'
                 if (-not (Test-UPSafeFolder $Row.Path $Root)) { $res.Folder = 'Leftover kept (outside the profiles folder)'; $partial = $true }
                 elseif (Remove-UPFolder $Row.Path) { $res.Folder = 'Leftover removed' }
                 else { $res.Folder = 'Leftover remains (files in use? reboot and run Cleanup)'; $partial = $true }
+                & $say "Folder: $($res.Folder)" $(if ($partial) { 'Yellow' } else { 'Green' })
             }
         }
         else { $res.Profile = 'WhatIf' }
@@ -381,13 +397,15 @@ function Remove-UserProfileTarget {
 
     if (($RemoveAccount -or $Row.Kind -eq 'AccountOnly') -and $Row.HasAccount) {
         if ($PSCmdlet.ShouldProcess($Row.Account, 'Remove local account')) {
-            try { Remove-LocalUser -SID $Row.SID -ErrorAction Stop; $res.LocalAccount = 'Removed' }
-            catch { $res.LocalAccount = "FAILED: $($_.Exception.Message)"; $failed = $true }
+            try { Remove-LocalUser -SID $Row.SID -ErrorAction Stop; $res.LocalAccount = 'Removed'; & $say 'Local account: removed' Green }
+            catch { $res.LocalAccount = "FAILED: $($_.Exception.Message)"; $failed = $true; & $say "Local account: FAILED - $($_.Exception.Message)" Red }
         }
         else { $res.LocalAccount = 'WhatIf' }
     }
+    elseif ($Row.HasAccount) { & $say 'Local account: kept (RemoveAccount not set)' DarkGray }
 
     $res.Status = if ($failed) { 'Failed' } elseif ($partial) { 'Partial' } elseif ($WhatIfPreference) { 'WhatIf' } else { 'Removed' }
+    & $say "Result: $($res.Status)" $(switch ($res.Status) { 'Removed' { 'Green' } 'WhatIf' { 'Gray' } default { 'Yellow' } })
     return $res
 }
 
@@ -535,8 +553,9 @@ function Invoke-UPInteractive {
                 $selected = @($allUsers | Where-Object { $selectedKeys.Contains($_.SID) })
                 if (-not (Confirm-UPDeletion -SelectedItems $selected)) { Write-Host 'Cancelled.' -ForegroundColor Yellow; Start-Sleep -Seconds 1; break }
                 Clear-Host
-                Write-Host 'Removing...' -ForegroundColor Red
-                return @(foreach ($t in $selected) { Remove-UserProfileTarget -Row $t -RemoveAccount -Root $Root -Confirm:$false })
+                Write-Host "Removing $($selected.Count) user(s)..." -ForegroundColor Red
+                $i = 0
+                return @(foreach ($t in $selected) { $i++; Remove-UserProfileTarget -Row $t -RemoveAccount -Root $Root -Progress "[$i/$($selected.Count)] " -Confirm:$false })
             }
             81 { Clear-Host; return @() }
         }
@@ -600,7 +619,9 @@ function Invoke-UserRemoval {
                 if (-not $targets) { Write-Host 'Nothing to remove.'; return 0 }
                 # Leavers named explicitly lose their local account too; age-based cleanup keeps accounts unless asked.
                 $removeAccount = if ($Options.ContainsKey('RemoveAccount')) { [bool]$Options.RemoveAccount } else { [bool]$users }
-                $results = @(foreach ($t in $targets) { Remove-UserProfileTarget -Row $t -RemoveAccount:$removeAccount -Root $root -Confirm:$false -WhatIf:$WhatIfPreference })
+                Write-Host "Removing $($targets.Count) user(s)$(if ($WhatIfPreference) { ' (WhatIf - nothing changes)' })..." -ForegroundColor $(if ($WhatIfPreference) { 'Gray' } else { 'Red' })
+                $i = 0
+                $results = @(foreach ($t in $targets) { $i++; Remove-UserProfileTarget -Row $t -RemoveAccount:$removeAccount -Root $root -Progress "[$i/$($targets.Count)] " -Confirm:$false -WhatIf:$WhatIfPreference })
             }
             'Cleanup' {
                 $results = @(Invoke-UserProfileCleanup -Rows $rows -RemoveOrphanFolders:([bool]$Options.RemoveOrphanFolders) -Root $root -BackupDir $runDir -Confirm:$false -WhatIf:$WhatIfPreference)
@@ -613,6 +634,8 @@ function Invoke-UserRemoval {
             }
         }
 
+        Write-Host ''
+        Write-Host "Summary: $(($results | Group-Object Status | ForEach-Object { "$($_.Count) $($_.Name)" }) -join ', ')" -ForegroundColor Cyan
         $results | Format-Table -AutoSize -Wrap | Out-String -Width 250 | Out-Host
         if ($WhatIfPreference) { return 0 }
         if (-not (Test-Path $runDir)) { New-Item -ItemType Directory -Path $runDir -Force | Out-Null }
