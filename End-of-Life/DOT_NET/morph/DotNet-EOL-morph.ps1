@@ -2354,20 +2354,43 @@ function Invoke-DotNetEOL {
 
 #endregion
 
-#region ==================== ENTRY POINT - set $RMM, then pick ONE mode ====================
+#region ==================== ENTRY POINT - set $RMM, then switch modes on/off ====================
 
 # $true ONLY in an RMM component: the script then ends with 'exit <code>' so the RMM
 # sees the result. Leave $false when pasting into a console or RMM remote shell -
 # exit would end that session mid-way through the engineer's other patching work.
-$RMM = $false
+$RMM = $true
 
-$exitCode = Invoke-DotNetEOL                                                    # Check (read-only)
-# $exitCode = Invoke-DotNetEOL -Mode Recon                                      # who uses what (read-only, slow)
-# $exitCode = Invoke-DotNetEOL -Mode Recon -Options @{ TargetVersion = '6.0'; SkipAssemblyScan = $true }
-# $exitCode = Invoke-DotNetEOL -Mode Remove                                     # DRY RUN below 8.0.28
-# $exitCode = Invoke-DotNetEOL -Mode Remove -Options @{ RemoveBelow = '8.0.28'; CleanLeftoverFolders = $true; CleanLeftoverRegistry = $true; Armed = $true }
-# $exitCode = Invoke-DotNetEOL -Mode Update -Options @{ WhatIf = $true }        # preview 8 + 10
-# $exitCode = Invoke-DotNetEOL -Mode Update -Options @{ Major = '8', '10' }     # LIVE
+# Switch on any combination. Enabled modes always run in this order:
+#   Recon (evidence before changes) -> Update -> Remove -> Check (verify the result)
+$Run = [ordered]@{
+    Recon  = $false   # who uses which runtime (read-only, slow)
+    Update = $true    # install/patch latest 8 + 10 (LIVE unless WhatIf)
+    Remove = $true    # remove everything below RemoveBelow (LIVE only with Armed)
+    Check  = $true    # verify: exit 2 if EOL .NET is still present
+}
+
+# Options per mode (parameters of the underlying function)
+$ModeOptions = @{
+    Recon  = @{ SkipAssemblyScan = $true }                  # e.g. TargetVersion = '6.0'
+    Update = @{ Major = '8', '10' }                         # add WhatIf = $true to preview
+    Remove = @{ RemoveBelow = '8.0.28'; CleanLeftoverFolders = $true; CleanLeftoverRegistry = $true; Armed = $true }   # drop Armed for a dry run
+    Check  = @{}
+}
+
+$codes = [ordered]@{}
+foreach ($mode in $Run.Keys) {
+    if (-not $Run[$mode]) { continue }
+    Write-Host "`n#################### $mode ####################" -ForegroundColor Cyan
+    $codes[$mode] = Invoke-DotNetEOL -Mode $mode -Options $ModeOptions[$mode]
+}
+
+# Worst result wins (least to most severe): 0 < 3010 < 2 < 3 < 1 < 10
+$exitCode = 0
+foreach ($c in 3010, 2, 3, 1, 10) { if (@($codes.Values) -contains $c) { $exitCode = $c } }
+
+$summary = ($codes.Keys | ForEach-Object { "$_=$($codes[$_])" }) -join '  '
+Write-Host "`nResults: $summary  -> Exit: $exitCode"
 
 if ($RMM) { exit $exitCode }
 Write-Host "Exit code: $exitCode (session left open; set `$RMM = `$true for RMM components)"
