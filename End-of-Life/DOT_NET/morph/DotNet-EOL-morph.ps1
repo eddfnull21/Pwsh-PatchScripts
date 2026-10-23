@@ -2373,7 +2373,7 @@ $Run = [ordered]@{
 # Options per mode (parameters of the underlying function)
 $ModeOptions = @{
     Recon  = @{ SkipAssemblyScan = $true }                  # e.g. TargetVersion = '6.0'
-    Update = @{ Major = '8', '10' }                         # add WhatIf = $true to preview
+    Update = @{ Major = '8','9','10' }                         # add WhatIf = $true to preview
     Remove = @{ RemoveBelow = '8.0.28'; CleanLeftoverFolders = $true; CleanLeftoverRegistry = $true; Armed = $true }   # drop Armed for a dry run
     Check  = @{}
 }
