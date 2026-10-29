@@ -8,7 +8,8 @@
     One script, four modes, chosen in the ENTRY POINT at the bottom:
 
       Check   DEFAULT. Fast EOL scan of the shared runtime folders and SDKs. Read-only.
-              EOL = major.minor in -EoLVersions (1.0-3.1, 5.0, 6.0, 7.0).
+              EOL = Microsoft's release feed (support phase 'eol' or end-of-support date
+              passed) plus -EoLVersions; the built-in list alone when the feed is unreachable.
       Recon   Evidence-based "who uses which runtime" inventory: dotnet CLI, Framework
               registry, ARP, loaded modules of running processes, runtimeconfig.json,
               services, scheduled tasks, IIS and a binary scan. Each runtime gets a verdict:
@@ -57,8 +58,9 @@
 
     Update needs outbound HTTPS to builds.dotnet.microsoft.com. winget is no longer used.
 
-    The EOL list is policy, not data: .NET 8 and 9 reach end of support on 2026-11-10.
-    Add '8.0','9.0' to EoLVersions and raise RemoveBelow when that date passes.
+    Check takes end-of-support dates from Microsoft's releases-index.json, so .NET 8 and 9
+    are flagged automatically from 2026-11-11. RemoveBelow is still policy: raise it yourself
+    (after a Recon) when you are ready to uninstall a whole major version.
 #>
 
 #region -------------------- Check: Test-DotNetSEoL (fast, read-only) --------------------
@@ -69,6 +71,32 @@ function Test-DotNetSEoL {
         [string]$ComputerName = $env:COMPUTERNAME,
         [string[]]$EoLVersions = @('1.0', '1.1', '2.0', '2.1', '2.2', '3.0', '3.1', '5.0', '6.0', '7.0')
     )
+
+    # EOL = Microsoft's feed (support-phase 'eol' or eol-date passed) plus the built-in list above.
+    # Offline, the built-in list alone is used. The date check flags a version the day after its
+    # end of support, even before Microsoft flips its support-phase.
+    $eolSet = [System.Collections.Generic.HashSet[string]]::new([string[]]$EoLVersions)
+    $today  = (Get-Date).Date
+    $soon   = @()
+    try {
+        $ProgressPreference = 'SilentlyContinue'
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+        $index = Invoke-RestMethod -Uri 'https://builds.dotnet.microsoft.com/dotnet/release-metadata/releases-index.json' `
+                                   -UseBasicParsing -TimeoutSec 30 -ErrorAction Stop
+        if ($index -is [string]) { $index = $index | ConvertFrom-Json }
+        $channels = @($index.'releases-index')
+        if (-not $channels) { throw 'releases-index.json has no releases-index entries.' }
+        foreach ($ch in $channels) {
+            $end = [datetime]::MinValue
+            $hasEnd = [datetime]::TryParseExact([string]$ch.'eol-date', 'yyyy-MM-dd', [cultureinfo]::InvariantCulture,
+                                                [Globalization.DateTimeStyles]::None, [ref]$end)
+            if ($ch.'support-phase' -eq 'eol' -or ($hasEnd -and $today -gt $end)) { $null = $eolSet.Add([string]$ch.'channel-version') }
+            elseif ($hasEnd -and ($end - $today).TotalDays -le 60) { $soon += [pscustomobject]@{ Channel = [string]$ch.'channel-version'; End = $end } }
+        }
+        $eolSource = 'Microsoft release feed + built-in list'
+    } catch {
+        $eolSource = "built-in list only - feed unavailable ($($_.Exception.Message))"
+    }
 
     $searchPaths = @(
         'C:\Program Files\dotnet\shared',
@@ -88,7 +116,7 @@ function Test-DotNetSEoL {
             Get-ChildItem -Path $runtimePath -Directory -ErrorAction SilentlyContinue | ForEach-Object {
                 $versionFolder = $_.Name
                 $majorMinor = ($versionFolder -split '\.')[0..1] -join '.'
-                $isEoL = $EoLVersions -contains $majorMinor
+                $isEoL = $eolSet.Contains($majorMinor)
 
                 $findings.Add([pscustomobject]@{
                     ComputerName    = $ComputerName
@@ -113,7 +141,7 @@ function Test-DotNetSEoL {
             foreach ($sdk in $sdks) {
                 if ($sdk -match '^(\d+\.\d+)\.\d+') {
                     $majorMinor = $Matches[1]
-                    $isEoL = $EoLVersions -contains $majorMinor
+                    $isEoL = $eolSet.Contains($majorMinor)
                     $findings.Add([pscustomobject]@{
                         ComputerName = $ComputerName
                         Runtime      = 'SDK'
@@ -134,6 +162,12 @@ function Test-DotNetSEoL {
     }
 
     $findings | Sort-Object EndOfLife -Descending | Format-Table -AutoSize | Out-Host
+    Write-Host "EOL list: $eolSource"
+    foreach ($s in $soon) {
+        if (@($findings | Where-Object { -not $_.EndOfLife }).MajorMinor -contains $s.Channel) {
+            Write-Host ("[!] .NET {0} reaches end of support on {1:yyyy-MM-dd} ({2} days)" -f $s.Channel, $s.End, [int]($s.End - $today).TotalDays) -ForegroundColor Yellow
+        }
+    }
 
     $eolCount = ($findings | Where-Object EndOfLife).Count
     if ($eolCount -gt 0) {
