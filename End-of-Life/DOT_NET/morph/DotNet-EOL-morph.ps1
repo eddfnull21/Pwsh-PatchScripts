@@ -1,4 +1,5 @@
 # Tested with PSScriptAnalyzer 1.25.0 and Pester 6.2.0 on Windows PowerShell 5.1 (tests\Morphs.Tests.ps1, 2026-10-11): static, paste-model and elevation-gate checks; live changes not run.
+# morph2 (2026-10-29): Update-DotNetRuntime downloads from Microsoft's release feed (BITS, Invoke-WebRequest fallback) instead of winget. Not yet covered by the tests above.
 <#
 .SYNOPSIS
     .NET (Core / 5+) end-of-life toolkit - Check / Recon / Remove / Update. Paste-and-run.
@@ -18,9 +19,15 @@
               dependency order, MSI and Burn bundles, both registry views. .NET Framework,
               .NET Standard, Visual Studio, Mono, SDK/targeting packs for Framework are
               deny-listed. Detects and cleans "ghost" ARP keys. DRY RUN unless Armed.
-      Update  Within supported majors (default 8 and 10): installs the latest patch via
-              winget, then removes older patch bundles, orphaned child MSIs and leftover
-              runtime folders no installer owns. Newest is always kept. LIVE unless WhatIf.
+      Update  Within supported majors (default 8 and 10): finds every runtime and SDK feature
+              band ON DISK, downloads the latest patch straight from Microsoft's release feed
+              (builds.dotnet.microsoft.com - the data behind dotnet.microsoft.com/download)
+              with BITS, Invoke-WebRequest as fallback, checks SHA512 + Microsoft signature,
+              installs silently, then removes older patch bundles, orphaned child MSIs and
+              leftover runtime folders no installer owns. Newest is always kept.
+              SDKs are REMOVED by default (runtime-only machines): runtimes that came with an
+              SDK are first installed standalone so they survive. KeepSdk keeps SDKs and patches
+              them within their feature band. LIVE unless WhatIf.
 
     Run Check or Recon first. Remove does not check whether an app still needs a runtime.
 
@@ -34,6 +41,7 @@
     Invoke-DotNetEOL -Mode Remove                            # dry run
     Invoke-DotNetEOL -Mode Remove -Options @{ CleanLeftoverFolders = $true; CleanLeftoverRegistry = $true; Armed = $true }
     Invoke-DotNetEOL -Mode Update -Options @{ WhatIf = $true }
+    Invoke-DotNetEOL -Mode Update -Options @{ Major = '8','10'; KeepSdk = $true }   # build/dev machine
 
     After a paste the functions stay loaded: Test-DotNetSEoL, Get-DotNetInventory
     (-PassThru for objects), Remove-OldDotNet, Update-DotNetRuntime.
@@ -43,9 +51,11 @@
         0     OK / nothing to do / dry run complete
         1     Unexpected error
         2     Check: end-of-life .NET found
-        3     Remove/Update: one or more actions failed
+        3     Remove/Update: one or more actions failed (Update: also download/verify failures)
         3010  Remove/Update: reboot required to finish
         10    Remove -Armed / live Update needs an elevated or SYSTEM session
+
+    Update needs outbound HTTPS to builds.dotnet.microsoft.com. winget is no longer used.
 
     The EOL list is policy, not data: .NET 8 and 9 reach end of support on 2026-11-10.
     Add '8.0','9.0' to EoLVersions and raise RemoveBelow when that date passes.
@@ -93,11 +103,13 @@ function Test-DotNetSEoL {
         }
     }
 
-    # Also check dotnet CLI output if available
-    $dotnetCmd = Get-Command dotnet -ErrorAction SilentlyContinue
-    if ($dotnetCmd) {
+    # SDKs via each install root's dotnet.exe (PATH is often missing in RMM/SYSTEM sessions), plus any on PATH.
+    # x64 and x86 hosts each list only their own SDKs; Sort-Object -Unique dedupes case-insensitively.
+    $dotnetExes = @($searchPaths | ForEach-Object { Join-Path (Split-Path $_ -Parent) 'dotnet.exe' }) +
+                  @(Get-Command dotnet.exe -CommandType Application -All -ErrorAction SilentlyContinue | ForEach-Object Source)
+    foreach ($dotnetExe in @($dotnetExes | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Sort-Object -Unique)) {
         try {
-            $sdks = & dotnet --list-sdks 2>$null
+            $sdks = & $dotnetExe --list-sdks 2>$null
             foreach ($sdk in $sdks) {
                 if ($sdk -match '^(\d+\.\d+)\.\d+') {
                     $majorMinor = $Matches[1]
@@ -2024,31 +2036,169 @@ public static extern int MsiQueryProductStateW(string szProduct);
 
 #region -------------------- Update: Update-DotNetRuntime (patch + trim within supported majors) --------------------
 
+<#
+    Installers come straight from Microsoft's release feed - the same data behind
+    https://dotnet.microsoft.com/download/dotnet/<major>.0 :
+        https://builds.dotnet.microsoft.com/dotnet/release-metadata/<major>.0/releases.json
+    Download: BITS (foreground), Invoke-WebRequest as fallback; no progress bars either way.
+    A file only runs if it matches the published SHA512 AND has a valid Microsoft signature.
+
+    What to update is read from DISK (sdk\ and shared\<framework>\ under Program Files\dotnet),
+    not from visible ARP bundles: runtimes that came with an SDK have no bundle of their own,
+    so the winget version never patched them (e.g. 10.0.13 from SDK 10.0.402).
+    Order per root: SDK band -> Windows Desktop -> ASP.NET Core -> .NET Runtime, re-reading
+    disk each time, so a runtime an SDK/Desktop installer already brought current is skipped.
+
+    SDKs (default, runtime-only machines): every runtime on disk that no standalone bundle owns
+    is installed standalone first, then the SDK bundles are uninstalled. The SDK is kept if any
+    step before it failed, and a missing runtime afterwards counts as a failure.
+    VS-installed SDKs ("... from Visual Studio") are never touched.
+
+    -Major         Major versions to maintain (default 8, 10). Previews/RCs are never installed.
+    -KeepSdk       Keep SDKs and patch each feature band (10.0.402 -> latest 10.0.4xx).
+    -DownloadPath  Installers and their setup logs (default %WINDIR%\Temp\DotNetUpdate).
+#>
 function Update-DotNetRuntime {
     [CmdletBinding(SupportsShouldProcess)]
     param(
         [ValidatePattern('^\d+$')]
-        [string[]]$Major = @('8', '10')
+        [string[]]$Major = @('8', '10'),
+        [switch]$KeepSdk,
+        [string]$DownloadPath = (Join-Path $env:WINDIR 'Temp\DotNetUpdate')
     )
 
     $okCodes = 0, 3010, 1641   # 3010/1641 = success, reboot needed
     $mode    = if ($WhatIfPreference) { 'PREVIEW (WhatIf) - no changes will be made' } else { 'LIVE - changes will be made' }
     $paths   = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
                'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+    $feed    = 'https://builds.dotnet.microsoft.com/dotnet/release-metadata'
+
+    $ProgressPreference = 'SilentlyContinue'   # no progress bars (also makes Invoke-WebRequest far faster on 5.1)
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
     $getEntries   = { Get-ItemProperty $paths -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName } }
     $isRegistered = { param($key) [bool](& $getEntries | Where-Object PSChildName -eq $key) }
 
-    # Locate winget once (not on PATH when running as SYSTEM)
-    # -AllUsers needs admin; fall back to PATH so a non-admin -WhatIf preview still works.
-    $wingetDir = try { (Get-AppxPackage -AllUsers -Name Microsoft.DesktopAppInstaller -ErrorAction Stop |
-                  Sort-Object Version | Select-Object -Last 1).InstallLocation } catch { $null }
-    $winget = if ($wingetDir) { Join-Path $wingetDir 'winget.exe' } else { (Get-Command winget.exe -ErrorAction SilentlyContinue).Source }
-    if (-not ($winget -and (Test-Path $winget))) { $winget = $null }
+    # Machine-wide install roots.
+    # shortcut: the x64-emulation root on ARM64 (dotnet\x64) is not patched; add it here if you run x64 .NET on ARM64.
+    $osArch     = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
+    $nativeArch = switch ($osArch) { 'ARM64' { 'arm64' } 'AMD64' { 'x64' } default { 'x86' } }
+    $pf64       = if ($env:ProgramW6432) { $env:ProgramW6432 } else { $env:ProgramFiles }
+    $installRoots = @([pscustomobject]@{ Path = Join-Path $pf64 'dotnet'; Arch = $nativeArch })
+    if (${env:ProgramFiles(x86)} -and $nativeArch -ne 'x86') {
+        $installRoots += [pscustomobject]@{ Path = Join-Path ${env:ProgramFiles(x86)} 'dotnet'; Arch = 'x86' }
+    }
+
+    # GA <major>.0.x version folders under one root (preview folders never match).
+    $getVersions = {
+        param($Root, $Sub)
+        $dir = Join-Path $Root $Sub
+        if (Test-Path -LiteralPath $dir) {
+            Get-ChildItem -LiteralPath $dir -Directory -ErrorAction SilentlyContinue |
+                Where-Object Name -match "^$ver\.0\.\d+$" | ForEach-Object { [version]$_.Name }
+        }
+    }
+
+    # WiX dependency registrations: MSI ProductCode -> bundles (e.g. an SDK) that still need it.
+    # Such an MSI cannot be removed on its own, so it is skipped instead of counted as a failure.
+    $dependents    = @{}
+    $getDependents = {
+        $arp = @{}
+        foreach ($e in & $getEntries) { $arp[$e.PSChildName] = $e.DisplayName }
+        $map = @{}
+        foreach ($prov in Get-ChildItem 'HKLM:\SOFTWARE\Classes\Installer\Dependencies' -ErrorAction SilentlyContinue) {
+            $code = (Get-ItemProperty -LiteralPath $prov.PSPath -ErrorAction SilentlyContinue).'(default)'
+            if (-not $code) { continue }
+            $deps = @(Get-ChildItem -LiteralPath (Join-Path $prov.PSPath 'Dependents') -ErrorAction SilentlyContinue |
+                      ForEach-Object { if ($arp[$_.PSChildName]) { $arp[$_.PSChildName] } else { $_.PSChildName } })
+            if ($deps) { $map[$code] = $deps }
+        }
+        $map
+    }
+
+    # Download (BITS, then Invoke-WebRequest), verify SHA512 + Microsoft signature, install silently.
+    $installFile = {
+        param($File)
+        $null = New-Item -ItemType Directory -Path $DownloadPath -Force
+        $exe  = Join-Path $DownloadPath ([IO.Path]::GetFileName(([uri]$File.url).AbsolutePath))
+        $log  = [IO.Path]::ChangeExtension($exe, '.log')
+        Remove-Item -LiteralPath $exe -Force -ErrorAction SilentlyContinue
+        $via = 'BITS'
+        try {
+            Start-BitsTransfer -Source $File.url -Destination $exe -Priority Foreground -ErrorAction Stop
+        } catch {
+            Write-Host "        BITS failed ($($_.Exception.Message.Trim())) - falling back to Invoke-WebRequest"
+            $via = 'Invoke-WebRequest'
+            try { Invoke-WebRequest -Uri $File.url -OutFile $exe -UseBasicParsing -ErrorAction Stop }
+            catch { Write-Host "        FAILED download: $($_.Exception.Message)"; return $false }
+        }
+        if (-not $File.hash -or (Get-FileHash -LiteralPath $exe -Algorithm SHA512).Hash -ne $File.hash) {
+            Write-Host "        FAILED SHA512 check - file deleted, not run"
+            Remove-Item -LiteralPath $exe -Force -ErrorAction SilentlyContinue
+            return $false
+        }
+        $sig = Get-AuthenticodeSignature -FilePath $exe
+        if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'O=Microsoft Corporation') {
+            Write-Host "        FAILED signature check ($($sig.Status)) - file deleted, not run"
+            Remove-Item -LiteralPath $exe -Force -ErrorAction SilentlyContinue
+            return $false
+        }
+        Write-Host "        downloaded via $via; SHA512 and Microsoft signature OK - installing"
+        $attempt = 0
+        do {
+            $attempt++
+            $code = (Start-Process -FilePath $exe -ArgumentList "/install /quiet /norestart /log `"$log`"" -Wait -PassThru -WindowStyle Hidden).ExitCode
+            if ($code -eq 1618 -and $attempt -lt 3) { Write-Host "        another install is running (1618); retry in 30s"; Start-Sleep -Seconds 30 }
+        } while ($code -eq 1618 -and $attempt -lt 3)
+        Remove-Item -LiteralPath $exe -Force -ErrorAction SilentlyContinue
+        if ($code -in $okCodes) {
+            if ($code -ne 0) { $summary.RebootNeeded = $true }
+            Write-Host "        INSTALLED (exit $code)"
+            return $true
+        }
+        Write-Host "        FAILED install (exit $code) - log: $log"
+        $false
+    }
+
+    # Bring one product up to a releases.json component (runtime / sdk / windowsdesktop / aspnetcore-runtime).
+    $update = {
+        param([string]$What, [version]$Current, $Component, [string]$FileName, [switch]$Standalone)
+        if (-not $Component.version) { Write-Host "      $What`: $Current - WARNING: not in release metadata"; $summary.Failed++; return }
+        $target = [version]$Component.version
+        if ($Current -ge $target -and -not $Standalone) { Write-Host "      $What`: $Current - up to date"; return }
+        $file = @($Component.files | Where-Object name -eq $FileName)[0]
+        if (-not $file) { Write-Host "      $What`: $Current -> $target - WARNING: $FileName not published"; $summary.Failed++; return }
+        Write-Host "      $What`: $Current -> $target$(if ($Standalone) { '  (standalone, so it outlives the SDK)' })"
+        Write-Host "        $($file.url)"
+        if (-not $PSCmdlet.ShouldProcess("$What $target", 'Download and install')) {
+            Write-Host "        (preview) would download, verify and install"
+            return
+        }
+        if (& $installFile $file) { $summary.Updated++ } else { $summary.Failed++ }
+    }
+
+    # Does a visible bundle own this runtime (so it survives an SDK uninstall)?
+    # Desktop and Hosting bundles carry the .NET Runtime; Hosting covers x64 + x86.
+    $owners = @{
+        'Windows Desktop Runtime' = @('Windows Desktop Runtime')
+        'ASP.NET Core Runtime'    = @('ASP.NET Core Runtime', 'Hosting Bundle')
+        '.NET Runtime'            = @('.NET Runtime', 'Windows Desktop Runtime', 'Hosting Bundle')
+    }
+    $isOwned = {
+        param([string]$Name, [string]$Arch)
+        [bool](& $getBundles | Where-Object {
+            $_.Product -in $owners[$Name] -and ($_.Label -like "* ($Arch)" -or ($_.Product -eq 'Hosting Bundle' -and $Arch -ne 'arm64'))
+        })
+    }
 
     # Uninstalls one item, then checks the registry to confirm it is really gone
     $removeItem = {
         param($Item)
+        $needed = if ($Item.IsMsi) { $dependents[$Item.Key] }
+        if ($needed) {
+            Write-Host "        SKIPPED $($Item.Version)  $($Item.Key) - still required by $($needed -join ', ')"
+            return
+        }
         if (-not $PSCmdlet.ShouldProcess("$($Item.Name) $($Item.Key)", 'Uninstall')) {
             Write-Host "        (preview) would remove $($Item.Version)  $($Item.Key)"
             return
@@ -2099,31 +2249,32 @@ function Update-DotNetRuntime {
         Write-Host " Mode: $mode"
         Write-Host "=================================================="
 
-        $wingetIds = @{
-            'Windows Desktop Runtime' = "Microsoft.DotNet.DesktopRuntime.$ver"
-            '.NET Runtime'            = "Microsoft.DotNet.Runtime.$ver"
-            'ASP.NET Core Runtime'    = "Microsoft.DotNet.AspNetCore.$ver"
-        }
-
         # Visible bundles - names vary ("Runtime - 10.0.11" and "Runtime 10.0.11")
         $bundleDefs = @(
             @{ Rx = "^Microsoft (?<p>Windows Desktop Runtime|\.NET Runtime|ASP\.NET Core Runtime) (?:- )?(?<v>$ver\.0\.\d+) \((?<a>x64|x86|arm64)\)$" },
-            @{ Rx = "^Microsoft ASP\.NET Core (?<v>$ver\.0\.\d+) - Shared Framework \((?<a>x64|x86|arm64)\)$"; P = 'ASP.NET Core Runtime' }
+            @{ Rx = "^Microsoft ASP\.NET Core (?<v>$ver\.0\.\d+) - Shared Framework \((?<a>x64|x86|arm64)\)$"; P = 'ASP.NET Core Runtime' },
+            @{ Rx = "^Microsoft \.NET SDK (?<v>$ver\.0\.\d+) \((?<a>x64|x86|arm64)\)$"; P = 'SDK' },
+            @{ Rx = "^Microsoft \.NET (?:Core )?(?<v>$ver\.0\.\d+) - Windows Server Hosting$"; P = 'Hosting Bundle' }
         )
         $getBundles = {
             foreach ($e in & $getEntries) {
                 if ($e.SystemComponent -eq 1) { continue }
                 foreach ($d in $bundleDefs) {
                     if ($e.DisplayName -match $d.Rx) {
-                        $product = if ($d.P) { $d.P } else { $Matches.p }
+                        $m       = $Matches   # the MsiExec test below overwrites $Matches
+                        $product = if ($d.P) { $d.P } else { $m.p }
+                        $v       = [version]$m.v
+                        # SDKs are grouped per feature band (10.0.1xx, 10.0.4xx...): bands are separate products.
+                        $label   = if ($product -eq 'SDK') { 'SDK {0}.{1}.{2}xx' -f $v.Major, $v.Minor, [math]::Floor($v.Build / 100) } else { $product }
+                        if ($m.a) { $label += " ($($m.a))" }
                         $isMsi   = $e.UninstallString -match '^\s*"?MsiExec'
                         $cmd     = $e.QuietUninstallString
                         if (-not $isMsi -and -not $cmd -and $e.UninstallString) { $cmd = "$($e.UninstallString) /quiet" }
                         if ($isMsi -or $cmd) {
                             [pscustomobject]@{
                                 Product = $product
-                                Version = [version]$Matches.v
-                                Label   = "$product ($($Matches.a))"
+                                Version = $v
+                                Label   = $label
                                 Name    = $e.DisplayName
                                 Key     = $e.PSChildName
                                 IsMsi   = $isMsi
@@ -2138,7 +2289,7 @@ function Update-DotNetRuntime {
 
         # Hidden child MSIs (installed by bundles; can be left orphaned)
         $childPatterns = @(
-            "^Microsoft (?<c>\.NET Host FX Resolver|\.NET Host|\.NET Runtime|Windows Desktop Runtime) (?:- )?(?<v>$ver\.0\.\d+) \((?<a>x64|x86|arm64)\)$",
+            "^Microsoft (?<c>\.NET Host FX Resolver|\.NET Host|\.NET Runtime|Windows Desktop Runtime|ASP\.NET Core Runtime) (?:- )?(?<v>$ver\.0\.\d+) \((?<a>x64|x86|arm64)\)$",
             "^Microsoft (?<c>ASP\.NET Core) (?<v>$ver\.0\.\d+) (?:- )?Shared Framework \((?<a>x64|x86|arm64)\)$"
         )
         $getChildren = {
@@ -2161,43 +2312,88 @@ function Update-DotNetRuntime {
 
         # -----------------------------------------------------------
         Write-Host ""
-        Write-Host "[1/6] Locating winget"
-        if ($winget) { Write-Host "      Found winget $(& $winget --version) at $winget" }
-        else         { Write-Host "      WARNING: winget.exe not found. Updates skipped; cleanup still runs." }
+        Write-Host "[1/6] Scanning for installed .NET $ver components"
+        $before  = @(& $getBundles)
+        foreach ($b in $before | Sort-Object Label, Version) {
+            Write-Host ("      bundle   {0,-38} {1}" -f $b.Label, $b.Version)
+        }
+        $present = [bool]$before
+        $onDisk  = @()
+        foreach ($root in $installRoots) {
+            foreach ($sub in 'sdk', 'shared\Microsoft.NETCore.App', 'shared\Microsoft.AspNetCore.App', 'shared\Microsoft.WindowsDesktop.App') {
+                $found = @(& $getVersions $root.Path $sub | Sort-Object)
+                if (-not $found) { continue }
+                $present = $true
+                if ($sub -ne 'sdk') { $onDisk += ,@($root.Path, $sub) }
+                Write-Host ("      on disk  {0,-38} {1}" -f "$(Split-Path $sub -Leaf) ($($root.Arch))", ($found -join ', '))
+            }
+        }
+        if (-not $present) { Write-Host "      Nothing installed." }
+        $removeSdks = -not $KeepSdk -and [bool]@($before | Where-Object Product -eq 'SDK')
+        if ($removeSdks) { Write-Host "      SDK bundle(s) found - will be replaced by standalone runtimes (KeepSdk = `$true to keep)" }
 
         # -----------------------------------------------------------
         Write-Host ""
-        Write-Host "[2/6] Scanning for installed .NET $ver runtime bundles"
-        $before = @(& $getBundles)
-        if ($before) {
-            $before | Sort-Object Label, Version | ForEach-Object {
-                Write-Host ("      {0,-38} {1}" -f $_.Label, $_.Version)
+        Write-Host "[2/6] Reading Microsoft release metadata ($feed/$ver.0/releases.json)"
+        $latest = $null; $sdks = @()
+        if (-not $present) { Write-Host "      Skipped - nothing to update." }
+        else {
+            try {
+                $meta = Invoke-RestMethod -Uri "$feed/$ver.0/releases.json" -UseBasicParsing -TimeoutSec 120 -ErrorAction Stop
+                if ($meta -is [string]) { $meta = $meta | ConvertFrom-Json }
+                $ga     = @($meta.releases | Where-Object { $_.'release-version' -match '^\d+\.\d+\.\d+$' })
+                $latest = $ga | Sort-Object { [version]$_.'release-version' } | Select-Object -Last 1
+                $sdks   = @($ga | ForEach-Object { if ($_.sdks) { $_.sdks } else { $_.sdk } } |
+                            Where-Object { $_.version -match '^\d+\.\d+\.\d+$' })
+                if ($latest) {
+                    Write-Host "      Latest $($latest.'release-version') ($($latest.'release-date'))  support: $($meta.'support-phase')  end of support: $($meta.'eol-date')"
+                    if ($meta.'eol-date' -and [datetime]$meta.'eol-date' -lt (Get-Date)) {
+                        Write-Host "      WARNING: .NET $ver is past end of support - patching it does not make it supported."
+                    }
+                } else {
+                    Write-Host "      No GA release of .NET $ver yet - previews are not installed."
+                }
+            } catch {
+                Write-Host "      FAILED to read release metadata: $($_.Exception.Message)"
+                $summary.Failed++
             }
-        } else {
-            Write-Host "      No bundles found."
         }
 
         # -----------------------------------------------------------
         Write-Host ""
-        Write-Host "[3/6] Updating to the latest .NET $ver patch"
-        if (-not $before)     { Write-Host "      Skipped - no bundles to update." }
-        elseif (-not $winget) { Write-Host "      Skipped - winget not available." }
+        Write-Host "[3/6] Updating to the latest .NET $ver patch (direct from Microsoft)"
+        if (-not $latest) { Write-Host "      Skipped - no release to install." }
         else {
-            foreach ($product in $before.Product | Sort-Object -Unique) {
-                $id      = $wingetIds[$product]
-                $current = ($before | Where-Object Product -eq $product | Sort-Object Version | Select-Object -Last 1).Version
-                Write-Host "      $product (currently $current) -> winget id $id"
+            if ($WhatIfPreference) {
+                Write-Host "      Note: preview may also list runtimes that an SDK/Desktop/Hosting installer above would already update."
+            }
+            # Hosting Bundle: machine-wide (x64 + x86 runtime, ASP.NET Core and the IIS module).
+            $hosting = @($before | Where-Object Product -eq 'Hosting Bundle' | Sort-Object Version)
+            if ($hosting) { & $update 'Hosting Bundle' $hosting[-1].Version $latest.'aspnetcore-runtime' 'dotnet-hosting-win.exe' }
 
-                if ($PSCmdlet.ShouldProcess($id, 'winget install/upgrade')) {
-                    & $winget install --id $id --source winget --silent `
-                        --accept-package-agreements --accept-source-agreements --disable-interactivity | Out-Null
-                    $code = $LASTEXITCODE
-                    $new  = (& $getBundles | Where-Object Product -eq $product | Sort-Object Version | Select-Object -Last 1).Version
-                    if ($new -gt $current)     { Write-Host "      UPDATED: $current -> $new"; $summary.Updated++ }
-                    elseif ($new -eq $current) { Write-Host "      Already up to date ($current)" }
-                    else                       { Write-Host "      WARNING: winget returned code $code; version unchanged"; $summary.Failed++ }
-                } else {
-                    Write-Host "      (preview) would check for and install any newer $ver.0.x version"
+            foreach ($root in $installRoots) {
+                $a = $root.Arch
+                if ($KeepSdk) {
+                    # One SDK per feature band: 10.0.402 -> newest 10.0.4xx, never a jump to another band.
+                    $bands = @(& $getVersions $root.Path 'sdk' | Group-Object { [math]::Floor($_.Build / 100) })
+                    foreach ($band in $bands) {
+                        $current = $band.Group | Sort-Object | Select-Object -Last 1
+                        $label   = 'SDK {0}.{1}.{2}xx ({3})' -f $current.Major, $current.Minor, $band.Name, $a
+                        $best    = $sdks | Where-Object { [math]::Floor(([version]$_.version).Build / 100) -eq [int]$band.Name } |
+                                   Sort-Object { [version]$_.version } | Select-Object -Last 1
+                        if ($best) { & $update $label $current $best "dotnet-sdk-win-$a.exe" }
+                        else       { Write-Host "      $label`: $current - band not in the release feed, left alone" }
+                    }
+                }
+                foreach ($fx in @(
+                    @{ Dir = 'Microsoft.WindowsDesktop.App'; Name = 'Windows Desktop Runtime'; Key = 'windowsdesktop';     File = "windowsdesktop-runtime-win-$a.exe" }
+                    @{ Dir = 'Microsoft.AspNetCore.App';     Name = 'ASP.NET Core Runtime';    Key = 'aspnetcore-runtime'; File = "aspnetcore-runtime-win-$a.exe" }
+                    @{ Dir = 'Microsoft.NETCore.App';        Name = '.NET Runtime';            Key = 'runtime';            File = "dotnet-runtime-win-$a.exe" }
+                )) {
+                    $current = & $getVersions $root.Path "shared\$($fx.Dir)" | Sort-Object | Select-Object -Last 1
+                    if (-not $current) { continue }
+                    $standalone = $removeSdks -and -not (& $isOwned $fx.Name $a)
+                    & $update "$($fx.Name) ($a)" $current $latest.($fx.Key) $fx.File -Standalone:$standalone
                 }
             }
         }
@@ -2206,8 +2402,31 @@ function Update-DotNetRuntime {
         Write-Host ""
         Write-Host "[4/6] Removing older .NET $ver bundles (newest is always kept)"
         $after = if ($WhatIfPreference) { $before } else { @(& $getBundles) }
-        if (-not $after) { Write-Host "      Nothing to do." }
+        $sdkBundles = @()
+        if ($removeSdks) {
+            $sdkBundles = @($after | Where-Object Product -eq 'SDK')
+            $after      = @($after | Where-Object Product -ne 'SDK')
+        }
+        if (-not $after -and -not $sdkBundles) { Write-Host "      Nothing to do." }
+        $dependents = & $getDependents
         & $pruneGroups $after
+        if ($sdkBundles) {
+            if ($summary.Failed -or -not $latest) {
+                # Without verified standalone runtimes, uninstalling the SDK could take runtimes with it.
+                Write-Host "      SDK kept: a step above failed or no release was available - re-run after fixing it."
+            } else {
+                Write-Host "      Removing SDKs (runtime-only machine; KeepSdk = `$true to keep them)"
+                foreach ($s in $sdkBundles | Sort-Object Version) { & $removeItem $s }
+                if (-not $WhatIfPreference) {
+                    foreach ($d in $onDisk) {
+                        if (-not @(& $getVersions $d[0] $d[1])) {
+                            Write-Host "      WARNING: no .NET $ver left in $($d[0])\$($d[1]) after SDK removal - reinstall it"
+                            $summary.Failed++
+                        }
+                    }
+                }
+            }
+        }
 
         # -----------------------------------------------------------
         Write-Host ""
@@ -2217,6 +2436,7 @@ function Update-DotNetRuntime {
         }
         $children = @(& $getChildren)
         if (-not $children) { Write-Host "      No .NET $ver components found." }
+        $dependents = & $getDependents
         & $pruneGroups $children
 
         # -----------------------------------------------------------
@@ -2287,9 +2507,10 @@ function Update-DotNetRuntime {
     if (Test-Path $dotnet) {
         Write-Host ""
         Write-Host "=================================================="
-        Write-Host " Runtimes now installed (from $dotnet)"
+        Write-Host " Runtimes / SDKs now installed (from $dotnet)"
         Write-Host "=================================================="
         & $dotnet --list-runtimes | ForEach-Object { Write-Host "   $_" }
+        & $dotnet --list-sdks     | ForEach-Object { Write-Host "   SDK $_" }
     }
     Write-Host ""
     [pscustomobject]$total
@@ -2359,13 +2580,13 @@ function Invoke-DotNetEOL {
 # $true ONLY in an RMM component: the script then ends with 'exit <code>' so the RMM
 # sees the result. Leave $false when pasting into a console or RMM remote shell -
 # exit would end that session mid-way through the engineer's other patching work.
-$RMM = $true
+$RMM = $false
 
 # Switch on any combination. Enabled modes always run in this order:
 #   Recon (evidence before changes) -> Update -> Remove -> Check (verify the result)
 $Run = [ordered]@{
     Recon  = $false   # who uses which runtime (read-only, slow)
-    Update = $true    # install/patch latest 8 + 10 (LIVE unless WhatIf)
+    Update = $true    # download + install latest patch of 8 / 9 / 10 from Microsoft (LIVE unless WhatIf)
     Remove = $true    # remove everything below RemoveBelow (LIVE only with Armed)
     Check  = $true    # verify: exit 2 if EOL .NET is still present
 }
@@ -2373,7 +2594,7 @@ $Run = [ordered]@{
 # Options per mode (parameters of the underlying function)
 $ModeOptions = @{
     Recon  = @{ SkipAssemblyScan = $true }                  # e.g. TargetVersion = '6.0'
-    Update = @{ Major = '8','9','10' }                         # add WhatIf = $true to preview
+    Update = @{ Major = '8','9','10' }                      # add WhatIf = $true to preview; on build/dev machines Update = @{ Major = '8','9','10'; KeepSdk = $true }
     Remove = @{ RemoveBelow = '8.0.28'; CleanLeftoverFolders = $true; CleanLeftoverRegistry = $true; Armed = $true }   # drop Armed for a dry run
     Check  = @{}
 }
