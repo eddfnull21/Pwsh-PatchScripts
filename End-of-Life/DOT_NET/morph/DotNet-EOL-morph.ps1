@@ -2594,7 +2594,7 @@ $Run = [ordered]@{
 # Options per mode (parameters of the underlying function)
 $ModeOptions = @{
     Recon  = @{ SkipAssemblyScan = $true }                  # e.g. TargetVersion = '6.0'
-    Update = @{ Major = '8','9','10' }                      # add WhatIf = $true to preview; on build/dev machines Update = @{ Major = '8','9','10'; KeepSdk = $true }
+    Update = @{ Major = '8','9','10' }                      # add WhatIf = $true to preview; KeepSdk = $true on build/dev machines
     Remove = @{ RemoveBelow = '8.0.28'; CleanLeftoverFolders = $true; CleanLeftoverRegistry = $true; Armed = $true }   # drop Armed for a dry run
     Check  = @{}
 }
@@ -2610,8 +2610,10 @@ foreach ($mode in $Run.Keys) {
 $exitCode = 0
 foreach ($c in 3010, 2, 3, 1, 10) { if (@($codes.Values) -contains $c) { $exitCode = $c } }
 
-$summary = ($codes.Keys | ForEach-Object { "$_=$($codes[$_])" }) -join '  '
-Write-Host "`nResults: $summary  -> Exit: $exitCode"
+# Values are exit codes, not counts - label them so "0" reads as OK.
+$codeText = @{ 0 = 'OK'; 1 = 'error'; 2 = 'EOL found'; 3 = 'failures'; 3010 = 'reboot needed'; 10 = 'not elevated' }
+$summary  = ($codes.Keys | ForEach-Object { "$_=$($codes[$_]) ($($codeText[[int]$codes[$_]]))" }) -join '  '
+Write-Host "`nResults (exit codes): $summary  -> Exit: $exitCode ($($codeText[$exitCode]))"
 
 if ($RMM) { exit $exitCode }
 Write-Host "Exit code: $exitCode (session left open; set `$RMM = `$true for RMM components)"
